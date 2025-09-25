@@ -1,63 +1,89 @@
 import boto3
 import mysql.connector
-from configparser import ConfigParser
-from iam_ai_analyzer import analyze_policy
-import json
+from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
 
-config = ConfigParser()
-config.read("config.ini")
+# MySQL Configuration
+DB_HOST = "localhost"
+DB_USER = "root"
+DB_PASSWORD = "password"
+DB_NAME = "aws_iam"
 
-# AWS
-iam = boto3.client(
-    'iam',
-    aws_access_key_id=config['AWS']['aws_access_key_id'],
-    aws_secret_access_key=config['AWS']['aws_secret_access_key'],
-    region_name=config['AWS']['region']
-)
-
-# MySQL
-conn = mysql.connector.connect(
-    host=config['MYSQL']['host'],
-    user=config['MYSQL']['user'],
-    password=config['MYSQL']['password'],
-    database=config['MYSQL']['database']
-)
-cursor = conn.cursor()
-
-def fetch_user_policies(username):
+def get_iam_client():
+    """
+    Create an IAM client. Boto3 automatically checks:
+    1. Environment variables
+    2. AWS credentials file (~/.aws/credentials)
+    3. IAM role if running on EC2
+    """
     try:
-        policy_names = iam.list_user_policies(UserName=username).get('PolicyNames', [])
-        if not policy_names:
-            return "No inline policies."
+        return boto3.client("iam")
+    except NoCredentialsError:
+        print("Error: AWS credentials not found. Configure your AWS keys.")
+        exit(1)
+    except ClientError as e:
+        print(f"AWS Client error: {e}")
+        exit(1)
 
-        full_analysis = ""
-        for policy_name in policy_names:
-            policy = iam.get_user_policy(UserName=username, PolicyName=policy_name)
-            policy_doc = json.dumps(policy['PolicyDocument'], indent=2)
-            analysis = analyze_policy(policy_doc)
-            full_analysis += f"\n--- {policy_name} ---\n{analysis}\n"
-        return full_analysis.strip()
-    except Exception as e:
-        return f"Error: {e}"
-
-def store_user(username, arn, created, ai_analysis):
-    cursor.execute("""
-        REPLACE INTO iam_users (username, arn, create_date, ai_analysis)
-        VALUES (%s, %s, %s, %s)
-    """, (username, arn, created, ai_analysis))
-    conn.commit()
+def connect_mysql():
+    try:
+        conn = mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME
+        )
+        return conn
+    except mysql.connector.Error as err:
+        print(f"MySQL connection error: {err}")
+        exit(1)
 
 def fetch_and_store_users():
-    users = iam.list_users()['Users']
+    iam = get_iam_client()
+    try:
+        users = iam.list_users()["Users"]
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidClientTokenId':
+            print("Error: Invalid AWS credentials or expired token.")
+        elif e.response['Error']['Code'] == 'AccessDenied':
+            print("Error: IAM user does not have permission to list users.")
+        else:
+            print(f"AWS ClientError: {e}")
+        exit(1)
+    except EndpointConnectionError as e:
+        print(f"Error connecting to AWS endpoint: {e}")
+        exit(1)
+
+    conn = connect_mysql()
+    cursor = conn.cursor()
+
+    # Create table if it does not exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS iam_users (
+            user_name VARCHAR(255) PRIMARY KEY,
+            user_id VARCHAR(255),
+            arn VARCHAR(512),
+            create_date DATETIME
+        )
+    """)
+
     for user in users:
-        username = user['UserName']
-        arn = user['Arn']
-        created = user['CreateDate']
-        print(f"Fetching user: {username}")
-        analysis = fetch_user_policies(username)
-        store_user(username, arn, created, analysis)
+        try:
+            cursor.execute("""
+                INSERT INTO iam_users (user_name, user_id, arn, create_date)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    arn=VALUES(arn),
+                    create_date=VALUES(create_date)
+            """, (
+                user['UserName'],
+                user['UserId'],
+                user['Arn'],
+                user['CreateDate'].strftime('%Y-%m-%d %H:%M:%S')
+            ))
+        except mysql.connector.Error as err:
+            print(f"MySQL insert error for user {user['UserName']}: {err}")
 
-    print("All IAM users stored with AI analysis.")
-
-if __name__ == "__main__":
-    fetch_and_store_users()
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print(f"Fetched and stored {len(users)} IAM users successfully.")
